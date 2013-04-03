@@ -5,6 +5,7 @@ using System.Text;
 using System.Net.Sockets;
 using Wintellect.Threading.AsyncProgModel;
 using System.Configuration;
+using System.Net;
 
 namespace helion_proxy
 {
@@ -14,19 +15,34 @@ namespace helion_proxy
         {
             Console.WriteLine("Wokf AntiHaxxing Proxy Server by Hunter and Thanatos. Version 1");
 
-            var settings = LoadSettings();
+            var serverState = new ServerState();
+
+            // a new AsyncEnumerator is constructed for the sake of a new thread of execution
             var ae = new AsyncEnumerator();
-            var r = ae.BeginExecute(Server(ae, settings), ae.EndExecute);
+            var r = ae.BeginExecute(Server(ae, serverState), ae.EndExecute);
             r.AsyncWaitHandle.WaitOne();
         }
 
         class ClientState
         {
-            public readonly TcpClient tcp;
+            public readonly TcpClient localtcp;
 
-            public ClientState(TcpClient tcp)
+            public ClientState(TcpClient localtcp)
             {
-                this.tcp = tcp;
+                this.localtcp = localtcp;
+            }
+        }
+
+        class ServerState
+        {
+            public readonly Settings settings = LoadSettings();
+            public readonly IDictionary<TcpClient, ClientState> clients= new Dictionary<TcpClient, ClientState>();
+            public readonly SyncGate clientsMutex = new SyncGate();
+
+            public Socket remote = null;
+
+            public ServerState()
+            {
             }
         }
 
@@ -52,27 +68,40 @@ namespace helion_proxy
             };
         }
 
-        static IEnumerator<Int32> HandleClient(AsyncEnumerator ae, IDictionary<TcpClient, ClientState> clients, ClientState client)
+        static IEnumerator<Int32> HandleClient(AsyncEnumerator ae,
+                                               ServerState server,
+                                               ClientState client,
+                                               TcpClient tcpRecv,
+                                               TcpClient tcpSend)
         {
-            TcpClient tcp = client.tcp;
-            Socket sock = tcp.Client;
+            // add the client to the clients list
+            {
+                server.clientsMutex.BeginRegion(SyncGateMode.Exclusive, ae.End());
+                yield return 1;
+                var mutexResult = ae.DequeueAsyncResult();
+                {
+                    if (!server.clients.ContainsKey(client.localtcp))
+                    {
+                        server.clients[client.localtcp] = client;
+                    }
+                }
+                server.clientsMutex.EndRegion(mutexResult);
+            }
+
+            Socket sockRecv = tcpRecv.Client;
+            Socket sockSend = tcpSend.Client;
 
             byte[] buffer = new byte[1024];
             int len = 0;
-
-            tcp.SendTimeout = 10000;
-            tcp.ReceiveTimeout = 10000;
-            tcp.NoDelay = true;
-            tcp.LingerState.Enabled = false;
             while (true)
             {
                 // read message
-                sock.BeginReceive(buffer, 0, buffer.Length, SocketFlags.None, ae.End(), null);
+                sockRecv.BeginReceive(buffer, 0, buffer.Length, SocketFlags.None, ae.End(), null);
                 yield return 1;
 
                 try
                 {
-                    len = sock.EndReceive(ae.DequeueAsyncResult());
+                    len = sockRecv.EndReceive(ae.DequeueAsyncResult());
                     if (len == 0) break;
                 }
                 catch (Exception)
@@ -81,12 +110,12 @@ namespace helion_proxy
                 }
 
                 // echo the data back to the client
-                sock.BeginSend(buffer, 0, len, SocketFlags.None, ae.End(), null);
+                sockSend.BeginSend(buffer, 0, len, SocketFlags.None, ae.End(), null);
                 yield return 1;
 
                 try
                 {
-                    sock.EndSend(ae.DequeueAsyncResult());
+                    sockSend.EndSend(ae.DequeueAsyncResult());
                 }
                 catch (Exception)
                 {
@@ -94,19 +123,64 @@ namespace helion_proxy
                 }
             }
 
-            var removed = false;
-            lock (clients)
+            // remove the client from the list
             {
-                removed = clients.Remove(tcp);
+                server.clientsMutex.BeginRegion(SyncGateMode.Exclusive, ae.End());
+                yield return 1;
+                var mutexResult = ae.DequeueAsyncResult();
+                {
+                    if (server.clients.ContainsKey(client.localtcp))
+                    {
+                        var removed = server.clients.Remove(client.localtcp);
+                        Console.WriteLine("Client disconnected {0} - {1}", sockRecv.RemoteEndPoint, removed);
+
+                        // dont forget to dispose it
+                        tcpRecv.Close();
+                        tcpSend.Close();
+                    }
+                }
+                server.clientsMutex.EndRegion(mutexResult);
             }
-            Console.WriteLine("Client disconnected {0} - {1}", sock.RemoteEndPoint, removed);
         }
 
-        static IEnumerator<Int32> Server(AsyncEnumerator ae, Settings settings)
+        static IEnumerator<Int32> ServerConnectRemote(AsyncEnumerator ae, ServerState server, IPEndPoint ipe, TcpClient local)
         {
-            var clients = new Dictionary<TcpClient, ClientState>();
-            var serverSock = new TcpListener(System.Net.IPAddress.Parse(settings.addresslisten), settings.portlisten);
-            serverSock.Start();
+            // establish a client proxy -> real server connection
+            var newClientState = new ClientState(local);
+            var remote = new TcpClient(ipe.AddressFamily);
+            var settings = server.settings;
+            remote.NoDelay = true;
+            remote.LingerState.Enabled = false;
+
+            remote.BeginConnect(IPAddress.Parse(settings.addressforward), settings.portforward, ae.End(), ae);
+            yield return 1;
+
+            try
+            {
+                remote.EndConnect(ae.DequeueAsyncResult());
+
+                var remoteAe = new AsyncEnumerator();
+                var localAe = new AsyncEnumerator();
+                localAe.BeginExecute(HandleClient(localAe, server, newClientState, local, remote), localAe.EndExecute, localAe);
+                remoteAe.BeginExecute(HandleClient(remoteAe, server, newClientState, remote, local), remoteAe.EndExecute, remoteAe);
+
+                Console.WriteLine("Client Connected {0}", local.Client.RemoteEndPoint);
+            }
+            catch (SocketException)
+            {
+                Console.WriteLine("A client failed to connect, is the real server started?");
+                local.Close();
+                remote.Close();
+            }
+        }
+
+        static IEnumerator<Int32> Server(AsyncEnumerator ae, ServerState server)
+        {
+            var sleeper = new CountdownTimer();
+            var settings = server.settings;
+            var ipe = new IPEndPoint(IPAddress.Parse(settings.addressforward), settings.portforward);
+            var serverSock = new TcpListener(IPAddress.Parse(settings.addresslisten), settings.portlisten);
+            serverSock.Start(20);
 
             Console.WriteLine("Server started");
             Console.WriteLine("Listening on {0}:{1}", settings.addresslisten, settings.portlisten);
@@ -116,25 +190,28 @@ namespace helion_proxy
                 serverSock.BeginAcceptTcpClient(ae.End(), null);
                 yield return 1;
 
+                TcpClient local = null;
                 try
                 {
-                    TcpClient client = serverSock.EndAcceptTcpClient(ae.DequeueAsyncResult());
-                    // handle client
-                    var newClientState = new ClientState(client);
-                    lock (clients)
-                    {
-                        clients[client] = newClientState;
-                    }
-                    var clientAe = new AsyncEnumerator();
-                    clientAe.BeginExecute(HandleClient(clientAe, clients, newClientState), clientAe.EndExecute, clientAe);
-
-                    Console.WriteLine("Client Connected {0}", client.Client.RemoteEndPoint);
+                    local = serverSock.EndAcceptTcpClient(ae.DequeueAsyncResult());
+                    local.SendTimeout = 10000;
+                    local.ReceiveTimeout = 10000;
+                    local.NoDelay = true;
+                    local.LingerState.Enabled = false;
                 }
                 catch (SocketException)
                 {
                     Console.WriteLine("A client failed to connect");
                 }
+
+                if(local != null)
+                {
+                    // handle client
+                    var localAe = new AsyncEnumerator();
+                    localAe.BeginExecute(ServerConnectRemote(localAe, server, ipe, local), localAe.EndExecute, localAe);
+                }
             }
         }
+
     }
 }
