@@ -6,16 +6,21 @@ using System.Net.Sockets;
 using Wintellect.Threading.AsyncProgModel;
 using System.Configuration;
 using System.Net;
+using Toub.Collections;
+using System.Diagnostics;
 
 namespace helion_proxy
 {
+    using FilterFunc = Func<ClientState, byte[], int, FilterIntent>;
+
     class Program
     {
         static void Main(string[] args)
         {
             Console.WriteLine("Wokf AntiHaxxing Proxy Server by Hunter and Thanatos. Version 1");
 
-            var serverState = new ServerState();
+            var filter = new Filter();
+            var serverState = new ServerState(filter.Recv, filter.Send);
 
             // a new AsyncEnumerator is constructed for the sake of a new thread of execution
             var ae = new AsyncEnumerator();
@@ -23,56 +28,13 @@ namespace helion_proxy
             r.AsyncWaitHandle.WaitOne();
         }
 
-        class ClientState
-        {
-            public readonly TcpClient localtcp;
-
-            public ClientState(TcpClient localtcp)
-            {
-                this.localtcp = localtcp;
-            }
-        }
-
-        class ServerState
-        {
-            public readonly Settings settings = LoadSettings();
-            public readonly IDictionary<TcpClient, ClientState> clients= new Dictionary<TcpClient, ClientState>();
-            public readonly SyncGate clientsMutex = new SyncGate();
-
-            public Socket remote = null;
-
-            public ServerState()
-            {
-            }
-        }
-
-        class Settings
-        {
-            public string addresslisten;
-            public int portlisten;
-
-            public string addressforward;
-            public int portforward;
-        }
-
-        static Settings LoadSettings()
-        {
-            var s = ConfigurationManager.AppSettings;
-
-            return new Settings
-            {
-                addresslisten = s["addresslisten"],
-                portlisten = Convert.ToInt32(s["portlisten"]),
-                addressforward = s["addressforward"],
-                portforward = Convert.ToInt32(s["portforward"])
-            };
-        }
-
         static IEnumerator<Int32> HandleClient(AsyncEnumerator ae,
                                                ServerState server,
                                                ClientState client,
                                                TcpClient tcpRecv,
-                                               TcpClient tcpSend)
+                                               TcpClient tcpSend,
+                                               BufferWrapper bw,
+                                               FilterFunc filterFunc)
         {
             // add the client to the clients list
             {
@@ -90,37 +52,93 @@ namespace helion_proxy
 
             Socket sockRecv = tcpRecv.Client;
             Socket sockSend = tcpSend.Client;
-
-            byte[] buffer = new byte[1024];
+            bool wantDisconnect = false;
             int len = 0;
             while (true)
             {
                 // read message
-                sockRecv.BeginReceive(buffer, 0, buffer.Length, SocketFlags.None, ae.End(), null);
-                yield return 1;
-
                 try
                 {
-                    len = sockRecv.EndReceive(ae.DequeueAsyncResult());
-                    if (len == 0) break;
+                    // resize buffer if needed so that it has initialbuffersize spaces at the end
+                    if((bw.buffer.Length - len) < server.settings.initialbuffersize)
+                    {
+                        Array.Resize(ref bw.buffer, len + server.settings.initialbuffersize);
+                    }
+
+                    sockRecv.BeginReceive(bw.buffer, len, server.settings.initialbuffersize, SocketFlags.None, ae.End(), null);
                 }
                 catch (Exception)
                 {
                     break;
                 }
-
-                // echo the data back to the client
-                sockSend.BeginSend(buffer, 0, len, SocketFlags.None, ae.End(), null);
+                
                 yield return 1;
+                
 
                 try
                 {
-                    sockSend.EndSend(ae.DequeueAsyncResult());
+                    int tmplen = sockRecv.EndReceive(ae.DequeueAsyncResult());
+                    
+                    if (tmplen == 0)
+                    {
+                        break;
+                    }
+                    else
+                    {
+                        len += tmplen;
+                    }
                 }
                 catch (Exception)
                 {
                     break;
                 }
+                
+                // filter the packets here
+                switch (filterFunc(client, bw.buffer, len))
+                {
+                    case FilterIntent.Buffer:
+                        break;
+
+                    case FilterIntent.Accept:
+                        int sent = 0;
+                        while(sent < len)
+                        {
+                            // echo the data back to the client
+                            try
+                            {
+                                sockSend.BeginSend(bw.buffer, sent, len-sent, SocketFlags.None, ae.End(), null);
+                            }
+                            catch (Exception)
+                            {
+                                wantDisconnect = true;
+                                break;
+                            }
+                            yield return 1;
+
+                            try
+                            {
+                                sent += sockSend.EndSend(ae.DequeueAsyncResult());
+                            }
+                            catch (Exception)
+                            {
+                                wantDisconnect = true;
+                                break;
+                            }
+                        }
+                        len = 0;
+                        break;
+
+                    case FilterIntent.Drop:
+                        len = 0;
+                        break;
+
+                    case FilterIntent.Disconnect:
+                        wantDisconnect = true;
+                        break;
+                }
+
+                if(wantDisconnect)
+                    break;
             }
 
             // remove the client from the list
@@ -132,7 +150,7 @@ namespace helion_proxy
                     if (server.clients.ContainsKey(client.localtcp))
                     {
                         var removed = server.clients.Remove(client.localtcp);
-                        Console.WriteLine("Client disconnected {0} - {1}", sockRecv.RemoteEndPoint, removed);
+                        Console.WriteLine("Client disconnected {0} - {1}", client.localtcp.Client.RemoteEndPoint, removed);
 
                         // dont forget to dispose it
                         tcpRecv.Close();
@@ -146,7 +164,7 @@ namespace helion_proxy
         static IEnumerator<Int32> ServerConnectRemote(AsyncEnumerator ae, ServerState server, IPEndPoint ipe, TcpClient local)
         {
             // establish a client proxy -> real server connection
-            var newClientState = new ClientState(local);
+            
             var remote = new TcpClient(ipe.AddressFamily);
             var settings = server.settings;
             remote.NoDelay = true;
@@ -158,19 +176,55 @@ namespace helion_proxy
             try
             {
                 remote.EndConnect(ae.DequeueAsyncResult());
-
-                var remoteAe = new AsyncEnumerator();
-                var localAe = new AsyncEnumerator();
-                localAe.BeginExecute(HandleClient(localAe, server, newClientState, local, remote), localAe.EndExecute, localAe);
-                remoteAe.BeginExecute(HandleClient(remoteAe, server, newClientState, remote, local), remoteAe.EndExecute, remoteAe);
-
-                Console.WriteLine("Client Connected {0}", local.Client.RemoteEndPoint);
             }
             catch (SocketException)
             {
-                Console.WriteLine("A client failed to connect, is the real server started?");
+                Console.WriteLine("A client failed to connect, has the real server started?");
                 local.Close();
                 remote.Close();
+                remote = null;
+            }
+
+            if(remote != null)
+            {
+                var bufParam = new ClientBufferParam();
+
+                {
+                    server.bufferPoolMutex.BeginRegion(SyncGateMode.Exclusive, ae.End());
+                    yield return 1;
+                    var res = ae.DequeueAsyncResult();
+                    server.AllocBuffer(ae, bufParam);
+                    server.bufferPoolMutex.EndRegion(res);
+                }
+
+                {
+                    var newClientState = new ClientState(local, remote);
+                    var remoteAe = new AsyncEnumerator();
+                    var localAe = new AsyncEnumerator();
+                    var bw1 = new BufferWrapper(bufParam.sendbuffer);
+                    var bw2 = new BufferWrapper(bufParam.recvbuffer);
+                    localAe.BeginExecute(HandleClient(localAe, server, newClientState, local, remote, bw1, server.filterSend), ae.End(), localAe);
+                    remoteAe.BeginExecute(HandleClient(remoteAe, server, newClientState, remote, local, bw2, server.filterRecv), ae.End(), remoteAe);
+
+                    Console.WriteLine("Client Connected {0}", local.Client.RemoteEndPoint);
+
+                    yield return 2;
+                    for (int x = 0; x < 2; x++) 
+                    {
+                        IAsyncResult ar = ae.DequeueAsyncResult();
+                        ((AsyncEnumerator)ar.AsyncState).EndExecute(ar);
+                    }
+                    bufParam.sendbuffer = bw1.buffer;
+                    bufParam.recvbuffer = bw2.buffer;
+                }
+
+                {
+                    server.bufferPoolMutex.BeginRegion(SyncGateMode.Exclusive, ae.End());
+                    yield return 1;
+                    var res = ae.DequeueAsyncResult();
+                    server.FreeBuffer(ae, bufParam);
+                    server.bufferPoolMutex.EndRegion(res);
+                }
             }
         }
 
@@ -194,8 +248,6 @@ namespace helion_proxy
                 try
                 {
                     local = serverSock.EndAcceptTcpClient(ae.DequeueAsyncResult());
-                    local.SendTimeout = 10000;
-                    local.ReceiveTimeout = 10000;
                     local.NoDelay = true;
                     local.LingerState.Enabled = false;
                 }
@@ -212,6 +264,118 @@ namespace helion_proxy
                 }
             }
         }
-
     }
+
+    #region classes
+    enum FilterIntent
+    {
+        //Buffer more data
+        Buffer,
+
+        // Accept and Drop flushes the buffer before sending the data off
+        Accept,
+        Drop,
+
+        //Discard the buffer and disconnect
+        Disconnect
+    }
+    class ClientState
+    {
+        public readonly TcpClient localtcp;
+        public readonly TcpClient remotetcp;
+
+        public ClientState(TcpClient localtcp, TcpClient remotetcp)
+        {
+            this.localtcp = localtcp;
+            this.remotetcp = remotetcp;
+        }
+    }
+
+    class ClientBufferParam
+    {
+        public byte[] sendbuffer;
+        public byte[] recvbuffer;
+    }
+
+    class BufferWrapper
+    {
+        public byte[] buffer;
+        public BufferWrapper(byte[] buffer)
+        {
+            this.buffer = buffer;
+        }
+    }
+
+    class ServerState
+    {
+        public readonly Settings settings = LoadSettings();
+
+        public readonly IDictionary<TcpClient, ClientState> clients = new Dictionary<TcpClient, ClientState>();
+        public readonly SyncGate clientsMutex = new SyncGate();
+
+        public readonly PriorityQueue<byte[]> bufferPool = new PriorityQueue<byte[]>();
+        public readonly SyncGate bufferPoolMutex = new SyncGate();
+
+        public readonly FilterFunc filterRecv;
+        public readonly FilterFunc filterSend;
+
+        public ServerState(FilterFunc filterRecv, FilterFunc filterSend)
+        {
+            this.filterRecv = filterRecv;
+            this.filterSend = filterSend;
+
+            for (int i = 0; i < 1024;++i)
+            {
+                bufferPool.Enqueue(settings.initialbuffersize, new byte[settings.initialbuffersize]);
+            }
+        }
+
+        public void AllocBuffer(AsyncEnumerator ae, ClientBufferParam buffer)
+        {
+            if (bufferPool.Count < 2)
+            {
+                for (int i = 0; i < 1024; ++i)
+                {
+                    bufferPool.Enqueue(settings.initialbuffersize, new byte[settings.initialbuffersize]);
+                }
+            }
+            buffer.sendbuffer = bufferPool.Dequeue();
+            buffer.recvbuffer = bufferPool.Dequeue();
+            Console.WriteLine("ALLOCED {0} {1}", buffer.recvbuffer.Length, buffer.sendbuffer.Length);
+        }
+
+        public void FreeBuffer(AsyncEnumerator ae, ClientBufferParam buffer)
+        {
+            bufferPool.Enqueue(buffer.sendbuffer.Length, buffer.sendbuffer);
+            bufferPool.Enqueue(buffer.recvbuffer.Length, buffer.recvbuffer);
+            Console.WriteLine("FREED {0} {1}", buffer.recvbuffer.Length, buffer.sendbuffer.Length);
+        }
+
+        static Settings LoadSettings()
+        {
+            var s = ConfigurationManager.AppSettings;
+
+            return new Settings
+            {
+                addresslisten = s["addresslisten"],
+                portlisten = Convert.ToInt32(s["portlisten"]),
+                addressforward = s["addressforward"],
+                portforward = Convert.ToInt32(s["portforward"]),
+                initialbuffersize = Convert.ToInt32(s["initialbuffersize"])
+            };
+        }
+    }
+
+    class Settings
+    {
+        public string addresslisten;
+        public int portlisten;
+
+        public string addressforward;
+        public int portforward;
+
+        public int initialbuffersize;
+    }
+    #endregion
+
 }
